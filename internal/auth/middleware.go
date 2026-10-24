@@ -2,11 +2,14 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 )
+
+type identityContextKey struct{}
 
 const IdentityContextKey = "authenticated_identity"
 
@@ -30,7 +33,14 @@ func Middleware(cfg Config) gin.HandlerFunc {
 			return
 		}
 
+		// Store the identity in Gin's context.
 		c.Set(IdentityContextKey, identity)
+
+		// Also store it in the request context for net/http handlers,
+		// including the MCP SDK's Streamable HTTP handler.
+		ctx := context.WithValue(c.Request.Context(), identityContextKey{}, identity)
+		c.Request = c.Request.WithContext(ctx)
+
 		c.Next()
 	}
 }
@@ -42,5 +52,10 @@ func IdentityFromContext(c *gin.Context) (Identity, bool) {
 	}
 
 	identity, ok := value.(Identity)
+	return identity, ok
+}
+
+func IdentityFromRequest(r *http.Request) (Identity, bool) {
+	identity, ok := r.Context().Value(identityContextKey{}).(Identity)
 	return identity, ok
 }
