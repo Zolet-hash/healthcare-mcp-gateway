@@ -9,29 +9,77 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zolet-hash/healthcare-mcp-gateway/internal/auth"
 	"github.com/Zolet-hash/healthcare-mcp-gateway/internal/healthcare"
 	"github.com/Zolet-hash/healthcare-mcp-gateway/internal/httpserver"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type tenantTransport struct {
-	base     http.RoundTripper
-	tenantID string
+func testAuthConfig() auth.Config {
+	return auth.Config{
+		Secret:   []byte("e2e-test-secret-at-least-32-bytes-long"),
+		Issuer:   "healthcare-e2e-test",
+		Audience: "healthcare-mcp-gateway",
+	}
 }
 
-func (t tenantTransport) RoundTrip(
+func createTestToken(t *testing.T, cfg auth.Config, tenantID string) string {
+	t.Helper()
+
+	now := time.Now()
+
+	claims := auth.Claims{
+		TenantID: tenantID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "e2e-user",
+			Issuer:    cfg.Issuer,
+			Audience:  jwt.ClaimStrings{cfg.Audience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(10 * time.Minute)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	signed, err := token.SignedString(cfg.Secret)
+	if err != nil {
+		t.Fatalf("sign test token: %v", err)
+	}
+
+	return signed
+}
+
+type authTransport struct {
+	base        http.RoundTripper
+	token       string
+	spoofTenant string
+}
+
+func (t authTransport) RoundTrip(
 	req *http.Request,
 ) (*http.Response, error) {
 	cloned := req.Clone(req.Context())
 	cloned.Header = req.Header.Clone()
-	cloned.Header.Set("X-Tenant-ID", t.tenantID)
+
+	if t.token != "" {
+		cloned.Header.Set("Authorization", "Bearer "+t.token)
+	}
+
+	// This header must never override the signed JWT tenant.
+	if t.spoofTenant != "" {
+		cloned.Header.Set("X-Tenant-ID", t.spoofTenant)
+	}
+
 	return t.base.RoundTrip(cloned)
 }
 
 func connectTestClient(
 	t *testing.T,
 	endpoint string,
+	cfg auth.Config,
 	tenantID string,
+	spoofTenant string,
 ) *mcp.ClientSession {
 	t.Helper()
 
@@ -44,9 +92,10 @@ func connectTestClient(
 	)
 
 	httpClient := &http.Client{
-		Transport: tenantTransport{
-			base:     http.DefaultTransport,
-			tenantID: tenantID,
+		Transport: authTransport{
+			base:        http.DefaultTransport,
+			token:       createTestToken(t, cfg, tenantID),
+			spoofTenant: spoofTenant,
 		},
 		Timeout: 5 * time.Second,
 	}
@@ -74,17 +123,55 @@ func connectTestClient(
 	return session
 }
 
-func TestSearchPatientsThroughMCP(t *testing.T) {
+func TestMCPRejectsMissingBearerToken(t *testing.T) {
+	cfg := testAuthConfig()
 	router := httpserver.NewRouter(
 		healthcare.NewPatientService(),
+		cfg,
 	)
-	httpServer := httptest.NewServer(router)
-	t.Cleanup(httpServer.Close)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		server.URL+"/mcp",
+		strings.NewReader("{}"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("send unauthenticated request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf(
+			"status = %d, want %d",
+			resp.StatusCode,
+			http.StatusUnauthorized,
+		)
+	}
+}
+
+func TestSearchPatientsThroughMCP(t *testing.T) {
+	cfg := testAuthConfig()
+	router := httpserver.NewRouter(
+		healthcare.NewPatientService(),
+		cfg,
+	)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
 
 	session := connectTestClient(
 		t,
-		httpServer.URL+"/mcp",
+		server.URL+"/mcp",
+		cfg,
 		"tenant-demo",
+		"",
 	)
 
 	ctx, cancel := context.WithTimeout(
@@ -93,16 +180,11 @@ func TestSearchPatientsThroughMCP(t *testing.T) {
 	)
 	defer cancel()
 
-	tools, err := session.ListTools(
-		ctx,
-		&mcp.ListToolsParams{},
-	)
+	tools, err := session.ListTools(ctx, &mcp.ListToolsParams{})
 	if err != nil {
 		t.Fatalf("list MCP tools: %v", err)
 	}
 
-	// Check the advertised tool without depending on the
-	// SDK's internal representation of its tool schema.
 	toolJSON, err := json.Marshal(tools)
 	if err != nil {
 		t.Fatal(err)
@@ -139,25 +221,28 @@ func TestSearchPatientsThroughMCP(t *testing.T) {
 		"active",
 	} {
 		if !strings.Contains(string(resultJSON), expected) {
-			t.Errorf(
-				"result missing %q: %s",
-				expected, resultJSON,
-			)
+			t.Errorf("result missing %q: %s", expected, resultJSON)
 		}
 	}
 }
 
 func TestSearchPatientsCannotCrossTenants(t *testing.T) {
+	cfg := testAuthConfig()
 	router := httpserver.NewRouter(
 		healthcare.NewPatientService(),
+		cfg,
 	)
-	httpServer := httptest.NewServer(router)
-	t.Cleanup(httpServer.Close)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
 
+	// The signed token belongs to tenant-demo, but the client
+	// attempts to spoof tenant-other using X-Tenant-ID.
 	session := connectTestClient(
 		t,
-		httpServer.URL+"/mcp",
+		server.URL+"/mcp",
+		cfg,
 		"tenant-demo",
+		"tenant-other",
 	)
 
 	ctx, cancel := context.WithTimeout(
@@ -189,9 +274,6 @@ func TestSearchPatientsCannotCrossTenants(t *testing.T) {
 	}
 
 	if strings.Contains(string(resultJSON), "pat-003") {
-		t.Fatalf(
-			"cross-tenant patient leaked in result: %s",
-			resultJSON,
-		)
+		t.Fatalf("cross-tenant patient leaked in result: %s", resultJSON)
 	}
 }
