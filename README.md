@@ -1,5 +1,3 @@
-# healthcare-mcp-gateway
-
 # Healthcare MCP Gateway
 
 A secure, multi-tenant Model Context Protocol (MCP) gateway built with Go, designed to make healthcare API capabilities accessible to AI assistants through a small, well-defined set of tools.
